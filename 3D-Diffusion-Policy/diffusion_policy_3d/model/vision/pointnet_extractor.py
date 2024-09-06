@@ -3,10 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 import copy
+import pytorch3d.ops as torch3d_ops
 
 from typing import Optional, Dict, Tuple, Union, List, Type
 from termcolor import cprint
-
 
 def create_mlp(
         input_dim: int,
@@ -46,8 +46,6 @@ def create_mlp(
     if squash_output:
         modules.append(nn.Tanh())
     return modules
-
-
 
 
 class PointNetEncoderXYZRGB(nn.Module):
@@ -210,13 +208,18 @@ class DP3Encoder(nn.Module):
                  pointcloud_encoder_cfg=None,
                  use_pc_color=False,
                  pointnet_type='pointnet',
+                 use_language = False
                  ):
         super().__init__()
         self.imagination_key = 'imagin_robot'
-        self.state_key = 'agent_pos'
-        self.point_cloud_key = 'point_cloud'
-        self.rgb_image_key = 'image'
+        self.state_key = 'joint_states'
+        self.point_cloud_key = 'agentview_pcd'
+        self.rgb_image_key = 'agentview_rgb'
         self.n_output_channels = out_channel
+        self.n_points = 1024
+        self.use_language = use_language
+
+        cprint(f"[DP3Encoder] pcd output_channels: {self.n_output_channels}", "blue")
         
         self.use_imagined_robot = self.imagination_key in observation_space.keys()
         self.point_cloud_shape = observation_space[self.point_cloud_key]
@@ -255,13 +258,44 @@ class DP3Encoder(nn.Module):
         output_dim = state_mlp_size[-1]
 
         self.n_output_channels  += output_dim
-        self.state_mlp = nn.Sequential(*create_mlp(self.state_shape[0], output_dim, net_arch, state_mlp_activation_fn))
+
+        if self.use_language:
+            self.n_output_channels  += 512
+        self.state_mlp = nn.Sequential(*create_mlp(self.state_shape[0] + 1, output_dim, net_arch, state_mlp_activation_fn))
 
         cprint(f"[DP3Encoder] output dim: {self.n_output_channels}", "red")
 
 
     def forward(self, observations: Dict) -> torch.Tensor:
         points = observations[self.point_cloud_key]
+        # print("points", points.shape)
+        points = points.reshape(points.shape[0], -1, points.shape[-1])
+
+        # import open3d as o3d
+        # # Create Open3D point cloud
+        # np_points = points.cpu().numpy()[0]
+        # pcd_save = o3d.geometry.PointCloud()
+        # pcd_save.points = o3d.utility.Vector3dVector(np_points)
+        # # Save the point cloud to a PCD file
+        # o3d.io.write_point_cloud("/home/yfang52/scratch/zhan47/data/v_before.ply", pcd_save)
+
+        # import ipdb; ipdb.set_trace()
+        if points.shape[1] > self.n_points:
+            device = points.device
+            n_points = torch.tensor([self.n_points]*points.shape[0]).to(device)
+            _, sampled_indices = torch3d_ops.sample_farthest_points(points=points[...,:3], K=n_points)
+            batch_indices = torch.arange(points.shape[0], device=points.device).unsqueeze(-1)
+            points = points[batch_indices, sampled_indices]
+            # import open3d as o3d
+            # # Create Open3D point cloud
+            # np_points = points.cpu().numpy()[0]
+            # pcd_save = o3d.geometry.PointCloud()
+            # pcd_save.points = o3d.utility.Vector3dVector(np_points)
+            # # Save the point cloud to a PCD file
+            # o3d.io.write_point_cloud("/home/yfang52/scratch/zhan47/data/v_1024.ply", pcd_save)
+
+        # import ipdb; ipdb.set_trace()
+
         assert len(points.shape) == 3, cprint(f"point cloud shape: {points.shape}, length should be 3", "red")
         if self.use_imagined_robot:
             img_points = observations[self.imagination_key][..., :points.shape[-1]] # align the last dim
@@ -270,10 +304,11 @@ class DP3Encoder(nn.Module):
         # points = torch.transpose(points, 1, 2)   # B * 3 * N
         # points: B * 3 * (N + sum(Ni))
         pn_feat = self.extractor(points)    # B * out_channel
-            
-        state = observations[self.state_key]
-        state_feat = self.state_mlp(state)  # B * 64
-        final_feat = torch.cat([pn_feat, state_feat], dim=-1)
+        state = torch.cat((observations["gripper_state"], observations['joint_states']), dim=-1)
+        state_feat = self.state_mlp(state) 
+        lang_embedding = observations["instructions"]
+
+        final_feat = torch.cat([pn_feat, state_feat, lang_embedding], dim=-1)
         return final_feat
 
 
